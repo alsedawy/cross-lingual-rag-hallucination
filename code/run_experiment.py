@@ -1,0 +1,190 @@
+with open("IT_Q&A.txt", "r", encoding="latin-1") as f:
+    txt = f.read()
+
+print("File IT_Q&A.txt has been created successfully!")
+# ==============================================================================
+# ONE-CELL FINAL EXPERIMENT: RETRIEVAL vs RAG (EN + AR) WITH PLOTS
+# ==============================================================================
+
+# ----------------------------
+# 0. Install dependencies
+# ----------------------------
+!pip install -q rank_bm25 sentence-transformers scikit-learn matplotlib seaborn transformers
+
+# ----------------------------
+# 1. Imports & Models
+# ----------------------------
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+
+from rank_bm25 import BM25Okapi
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from transformers import pipeline
+
+EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+
+try:
+    GENERATOR = pipeline("text-generation", model="gpt2", tokenizer="gpt2", device=-1)
+    USE_GPT = True
+except:
+    USE_GPT = False
+    GENERATOR = None
+
+# ----------------------------
+# 2. Helper functions
+# ----------------------------
+def get_embedding(text):
+    return EMBEDDING_MODEL.encode([text])[0]
+
+def retrieve_bm25(query, qa_pairs, top_k=3):
+    corpus = [q + " " + a for q, a in qa_pairs]
+    tokenized = [c.split() for c in corpus]
+    bm25 = BM25Okapi(tokenized)
+    scores = bm25.get_scores(query.split())
+    return sorted(enumerate(scores), key=lambda x: x[1], reverse=True)[:top_k]
+
+def semantic_search(query, qa_pairs, top_k=3):
+    corpus = [q + " " + a for q, a in qa_pairs]
+    doc_emb = EMBEDDING_MODEL.encode(corpus)
+    q_emb = get_embedding(query)
+    sims = cosine_similarity([q_emb], doc_emb)[0]
+    return sorted(enumerate(sims), key=lambda x: x[1], reverse=True)[:top_k]
+
+def rerank(query, qa_pairs, top_k=3):
+    bm = retrieve_bm25(query, qa_pairs, 6)
+    idxs = [i for i,_ in bm]
+    docs = [qa_pairs[i][0]+" "+qa_pairs[i][1] for i in idxs]
+    sims = cosine_similarity([get_embedding(query)], EMBEDDING_MODEL.encode(docs))[0]
+    return [idxs[i] for i in np.argsort(sims)[::-1][:top_k]]
+
+def rrf_fuse(lists, k=3, c=60):
+    scores = defaultdict(float)
+    for lst in lists:
+        for r,i in enumerate(lst):
+            scores[i]+=1/(c+r+1)
+    return [i for i,_ in sorted(scores.items(), key=lambda x:x[1], reverse=True)[:k]]
+
+def generate_answer(question, ctxs):
+    if not USE_GPT:
+        return " ".join(ctxs[:2])
+    prompt = "Answer using only the context:\n" + "\n".join(ctxs) + f"\nQuestion:{question}\nAnswer:"
+    out = GENERATOR(prompt, max_length=80, temperature=0.05, return_full_text=False)
+    return out[0]["generated_text"]
+
+# ----------------------------
+# 3. Metrics
+# ----------------------------
+def f1(pred, gold):
+    p=set(pred.lower().split())
+    g=set(gold.lower().split())
+
+    if not p or not g:
+        return 0.0
+
+    inter=len(p & g)
+    if inter==0:
+        return 0.0
+
+    pr=inter/len(p)
+    rc=inter/len(g)
+
+    if pr+rc==0:
+        return 0.0
+
+    return 2*pr*rc/(pr+rc)
+
+
+def hallucination(pred, ctxs):
+    p=set(pred.lower().split())
+    c=set(" ".join(ctxs).lower().split())
+    return len([t for t in p if t not in c])/len(p) if p else 0
+
+def fidelity(pred, ctxs):
+    p=set(pred.lower().split())
+    c=set(" ".join(ctxs).lower().split())
+    return len([t for t in p if t in c])/len(p) if p else 0
+
+# ----------------------------
+# 4. Load Dataset
+# ----------------------------
+with open("IT_Q&A.txt","r",encoding="latin-1") as f:
+    txt=f.read()
+
+qa_pairs=[]
+q,ans,read=None,[],False
+for l in [x.strip() for x in txt.split("\n") if x.strip()]:
+    if l.startswith("Q.") and l.endswith("?"):
+        if q and ans: qa_pairs.append((q," ".join(ans)))
+        q=l[2:]; ans=[]; read=False
+    elif l.startswith("A."):
+        read=True; ans.append(l[2:])
+    elif read:
+        ans.append(l)
+if q and ans: qa_pairs.append((q," ".join(ans)))
+
+print("Loaded QA:",len(qa_pairs))
+
+# ----------------------------
+# 5. Test sets
+# ----------------------------
+test_set_en=[
+("What is cache memory?","Cache memory is a small, fast memory buffer"),
+("What is an API?","An API is a set of instructions"),
+("What does a technical support engineer do?","The work of a technical support engineer"),
+]
+
+test_set_ar=[
+("ما هي الذاكرة المؤقتة؟","Cache memory is a small, fast memory buffer"),
+("ما هو API؟","An API is a set of instructions"),
+("ما وظيفة مهندس الدعم الفني؟","The work of a technical support engineer"),
+]
+
+# ----------------------------
+# 6. Evaluation
+# ----------------------------
+def run_eval(test_set, mode):
+    res=[]
+    for qg,ag in test_set:
+        if mode=="baseline":
+            idxs=[i for i,_ in retrieve_bm25(qg,qa_pairs)]
+        elif mode=="semantic":
+            idxs=[i for i,_ in semantic_search(qg,qa_pairs)]
+        elif mode=="rerank":
+            idxs=rerank(qg,qa_pairs)
+        elif mode=="fusion":
+            idxs=rrf_fuse([
+                [i for i,_ in retrieve_bm25(qg,qa_pairs)],
+                [i for i,_ in semantic_search(qg,qa_pairs)]
+            ])
+        ctxs=[qa_pairs[i][1] for i in idxs]
+        pred=generate_answer(qg,ctxs)
+        res.append([f1(pred,ag),hallucination(pred,ctxs),fidelity(pred,ctxs)])
+    return np.mean(res,axis=0)
+
+methods=["baseline","semantic","rerank","fusion"]
+
+def eval_set(name,test):
+    data={m:run_eval(test,m) for m in methods}
+    df=pd.DataFrame(data,index=["F1","Hallucination","Fidelity"]).T
+    print(f"\n=== {name} ===")
+    print(df)
+    return df
+
+df_en=eval_set("English Test Set",test_set_en)
+df_ar=eval_set("Arabic Test Set",test_set_ar)
+
+# ----------------------------
+# 7. Plots
+# ----------------------------
+def plot(df,title):
+    df.plot(kind="bar",figsize=(10,4))
+    plt.title(title)
+    plt.ylim(0,1)
+    plt.show()
+
+plot(df_en,"English – Retrieval vs RAG")
+plot(df_ar,"Arabic – Retrieval vs RAG")
